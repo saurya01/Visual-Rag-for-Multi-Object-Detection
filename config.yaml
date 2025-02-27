@@ -1,0 +1,13 @@
+dataset:
+  images_path: "C:\\Users\\saury\\Downloads\\food_2.v5i.yolov8\\train\\images"   
+  labels_path: "C:\\Users\\saury\\Downloads\\food_2.v5i.yolov8\\train\\labels"   
+faiss:
+  index_path: "object_embeddings.faiss"
+  metadata_path: "object_metadata.json"
+labels:
+  names: ['biryani', 'burger', 'butter_chicken', 'chappati', 'chicken', 'chutney', 
+          'dahi_puri', 'dosa', 'egg', 'french fries', 'gobi_manchurian', 'gulab jamun', 
+          'idli', 'jalebi', 'naan', 'noodle', 'omelette', 'paneer masala', 'paneer_tikka', 
+          'pani_puri', 'paniyaram', 'paratha', 'parippuvada', 'payasam', 'pazhampori', 
+          'pongal', 'poori', 'potato_bhaji', 'puffs', 'rasgulla', 'rice', 'sambhar', 
+          'sambhar rice', 'samosa', 'sauce', 'tea', 'vada']
