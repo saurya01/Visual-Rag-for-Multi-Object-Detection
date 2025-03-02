@@ -8,6 +8,12 @@ import yaml
 import argparse
 from ultralytics import YOLO
 from PIL import Image
+import io
+import base64
+import os
+import google.auth.credentials
+import google.auth.transport.requests
+from google.generativeai import GenerativeModel, configure
 
 # Load configuration from YAML
 with open("config.yaml", "r") as f:
@@ -30,6 +36,22 @@ model.to(device)
 
 # Load YOLOv8 model for object detection
 yolo_model = YOLO("yolov8n.pt")  # Use "yolov8n.pt" or your fine-tuned model
+
+# Initialize Gemini model
+use_gemini = True
+try:
+    # Replace this with your actual API key
+    GOOGLE_API_KEY = "AIzaSyDXEOhpsO-VBF4_oWrNuX27vJ0rbm0yqeU"
+    
+    # Configure the Gemini API with the key
+    configure(api_key=GOOGLE_API_KEY)
+    
+    # Initialize Gemini model
+    gemini = GenerativeModel("gemini-1.5-flash")
+    print("[INFO] Gemini API initialized successfully with embedded API key.")
+except Exception as e:
+    print(f"[ERROR] Failed to initialize Gemini: {e}")
+    use_gemini = False
 
 def detect_objects(image_path):
     """Run YOLOv8 on the image and return detected object crops & bounding boxes."""
@@ -75,6 +97,54 @@ def search_faiss(query_embedding, top_k=3):
 
     return results
 
+def prepare_image_for_gemini(cv_image):
+    """Convert OpenCV image to format suitable for Gemini API."""
+    # Convert BGR to RGB
+    rgb_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+    # Convert to PIL Image
+    pil_image = Image.fromarray(rgb_image)
+    # Convert to bytes
+    buffer = io.BytesIO()
+    pil_image.save(buffer, format="JPEG")
+    image_bytes = buffer.getvalue()
+    # Return image bytes
+    return image_bytes
+
+def verify_with_gemini(query_image, retrieved_image):
+    """Use Google Gemini to verify if both images match."""
+    try:
+        # Convert OpenCV images to bytes format for Gemini
+        query_bytes = prepare_image_for_gemini(query_image)
+        retrieved_bytes = prepare_image_for_gemini(retrieved_image)
+        
+        # Format properly for Gemini API according to error message
+        query_part = {
+            "mime_type": "image/jpeg",
+            "data": base64.b64encode(query_bytes).decode('utf-8')
+        }
+        
+        retrieved_part = {
+            "mime_type": "image/jpeg",
+            "data": base64.b64encode(retrieved_bytes).decode('utf-8')
+        }
+        
+        # Create content object with parts
+        content = {
+            "parts": [
+                {"inline_data": query_part},
+                {"inline_data": retrieved_part},
+                {"text": "Are these two images of the same object?"}
+            ]
+        }
+        
+        response = gemini.generate_content(content)
+        
+        return "yes" in response.text.lower()
+    except Exception as e:
+        print(f"[ERROR] Gemini API call failed: {e}")
+        # Default to False on failure
+        return False
+
 def draw_bounding_boxes(image, boxes, labels, scores):
     """Draw bounding boxes with labels and confidence scores."""
     for (box, label, score) in zip(boxes, labels, scores):
@@ -84,25 +154,6 @@ def draw_bounding_boxes(image, boxes, labels, scores):
         label_text = f"{label}: {score:.2f}"  # Direct confidence score
         cv2.putText(image, label_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     return image
-
-def process_results(results, boxes):
-    """Filter objects dynamically based on FAISS distance threshold."""
-    """Dynamically filter objects based on FAISS distance distribution."""
-    distances = np.array([res["distance"] for res in results])
-    
-    if len(distances) == 0:
-        return [], []
-
-    mean_dist = np.mean(distances)
-    std_dist = np.std(distances)
-    threshold = mean_dist + std_dist  # Keep only results within 1 std deviation
-    
-    filtered_results = [(res, box) for res, box in zip(results, boxes) if res["distance"] <= threshold]
-
-    final_results = [res for res, _ in filtered_results]
-    final_boxes = [box for _, box in filtered_results]
-
-    return final_results, final_boxes
 
 def main(image_path, top_k):
     """Process query image and return top-k labels with matched images."""
@@ -114,35 +165,65 @@ def main(image_path, top_k):
         print("[WARNING] No objects detected in the image.")
         return
 
-    results = []
-    for i, crop in enumerate(object_crops):
+    verified_results = []
+    verified_boxes = []
+    
+    for i, (crop, box) in enumerate(zip(object_crops, boxes)):
+        print(f"[INFO] Processing object {i+1}")
         embedding = compute_embedding(crop)
         faiss_results = search_faiss(embedding, top_k)
+        
         if not faiss_results:
             print(f"[WARNING] No FAISS match found for object {i+1}.")
             continue
+        
+        object_verified = False
+        
+        for match in faiss_results:
+            retrieved_image_path = match["image_path"]
+            try:
+                retrieved_image = cv2.imread(retrieved_image_path)
+                if retrieved_image is None:
+                    print(f"[ERROR] Failed to load retrieved image: {retrieved_image_path}")
+                    continue
+                
+                # Verify using Gemini
+                if verify_with_gemini(crop, retrieved_image):
+                    # Convert distance to confidence score (lower distance = higher confidence)
+                    match["confidence"] = max(0, min(100, 100 * (1 - match["distance"] / 2)))
+                    match["verification_method"] = "Gemini"
+                    verified_results.append(match)
+                    verified_boxes.append(box)
+                    object_verified = True
+                    print(f"[Object {i+1}] Verified Category: {match['class_name']} (by Gemini)")
+                    break  # Stop after first verification for this object
+                else:
+                    print(f"[Object {i+1}] Match rejected by Gemini verification.")
+            except Exception as e:
+                print(f"[ERROR] Error processing match: {e}")
+        
+        if not object_verified:
+            print(f"[INFO] No verified matches for object {i+1}")
 
-        match = faiss_results[0]  # Take top-1 result
-        confidence = 100 - match["distance"]  # Convert FAISS distance to confidence
-        match["confidence"] = confidence  # Store confidence
-        results.append(match)
-
-        print(f"\n[Object {i+1}] Predicted Category: {match['class_name']} (Confidence: {confidence:.2f})")
-
-    # Filter results dynamically
-    filtered_results, filtered_boxes = process_results(results, boxes)
-
-    if not filtered_results:
-        print("[INFO] No objects met the confidence threshold.")
+    if not verified_results:
+        print("[INFO] No objects met verification criteria.")
         return
 
-    # Show matched images with bounding boxes
-    query_image = draw_bounding_boxes(query_image, filtered_boxes, 
-                                      [res["class_name"] for res in filtered_results],
-                                      [res["confidence"] for res in filtered_results])
+    # Draw bounding boxes on verified results
+    query_image = draw_bounding_boxes(
+        query_image, 
+        verified_boxes,
+        [f"{res['class_name']} (Gemini)" for res in verified_results],
+        [res["confidence"] for res in verified_results]
+    )
     
-    # Display only query image with relevant bounding boxes
-    cv2.imshow("Query Image (Filtered Detections)", query_image)
+    # Save result image
+    result_path = "result_" + os.path.basename(image_path)
+    cv2.imwrite(result_path, query_image)
+    print(f"[INFO] Result saved to {result_path}")
+    
+    # Display result
+    cv2.imshow("Query Image (Verified Detections)", query_image)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
